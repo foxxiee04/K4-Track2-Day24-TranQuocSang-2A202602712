@@ -1,39 +1,144 @@
-"""BƯỚC 3a — PII gate TRƯỚC KHI vào context/store (12').
 
-Đọc CHECKPOINTS.md (§3a) trước khi bắt đầu: Presidio không có tiếng Việt
-sẵn (AnalyzerEngine() mặc định chỉ hỗ trợ "en"). Đường an toàn cho 2h là
-regex recognizer + deny-list cho PERSON — coi spaCy/transformers NER là
-stretch goal, KHÔNG bắt buộc.
-
-Interface bắt buộc (tests/test_pii.py gọi trực tiếp 2 hàm này):
-
-    detect(text: str) -> list[dict]
-        Mỗi entity: {"type": str, "start": int, "end": int}
-        `type` là một trong: "VN_CCCD", "VN_PHONE", "VN_BANK_ACCOUNT", "EMAIL"
-        `start`/`end` là offset ký tự trong `text` (offset đầu bao gồm,
-        offset cuối KHÔNG bao gồm — giống slice Python text[start:end]).
-        Format này khớp với tests/vn_pii_testset.jsonl.
-
-    redact(text: str) -> str
-        Trả về `text` sau khi mọi entity từ detect() bị thay bằng
-        "[REDACTED_<TYPE>]". Phải xử lý overlap/thứ tự đúng khi có nhiều
-        entity (gợi ý: thay từ cuối văn bản về đầu để offset không bị lệch).
-
-Gợi ý định dạng (không bắt buộc đúng regex này, miễn đạt ngưỡng trên test
-set ở tests/vn_pii_testset.jsonl):
-    VN_CCCD          12 chữ số liên tiếp
-    VN_PHONE         0 + 9-10 chữ số, có thể có dấu cách/gạch ngang
-    VN_BANK_ACCOUNT  8-16 chữ số liên tiếp, thường đi kèm "STK"/"số tài khoản"
-    EMAIL            dạng chuẩn local@domain.tld
-
-Đo bằng: pytest tests/test_pii.py -v -s   (in ra precision/recall)
-"""
+"""PII detection and redaction for the Day24 governance lab."""
 from __future__ import annotations
+
+import re
+
+
+# Email thông dụng; cho phép dấu chấm kết thúc câu đứng ngoài email.
+_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
+    r"(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
+
+# Bắt các chuỗi số dài 8–16 chữ số, cho phép cách nhau bằng
+# dấu cách hoặc dấu gạch ngang. Phân loại bằng độ dài và ngữ cảnh.
+_NUMBER_RE = re.compile(
+    r"(?<![\w.@+-])\d(?:[ \t-]?\d){7,15}(?![\w@])"
+)
+
+_CONTEXT_PATTERNS = (
+    ("VN_CCCD", re.compile(r"\bCCCD\b", re.IGNORECASE)),
+    (
+        "VN_BANK_ACCOUNT",
+        re.compile(
+            r"(?:số\s+tài\s+khoản|tài\s+khoản|\bSTK\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "VN_PHONE",
+        re.compile(
+            r"(?:\bSĐT\b|\bSDT\b|số\s+điện\s+thoại|điện\s+thoại)",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _nearest_context(text: str, start: int) -> str | None:
+    """Trả về loại nhãn gần nhất đứng trước chuỗi số."""
+    prefix = text[max(0, start - 70):start]
+    nearest_type = None
+    nearest_end = -1
+
+    for entity_type, pattern in _CONTEXT_PATTERNS:
+        for match in pattern.finditer(prefix):
+            if match.end() > nearest_end:
+                nearest_end = match.end()
+                nearest_type = entity_type
+
+    return nearest_type
 
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    """Phát hiện CCCD, điện thoại, số tài khoản và email."""
+    entities: list[dict] = []
+
+    for match in _EMAIL_RE.finditer(text):
+        entities.append({
+            "type": "EMAIL",
+            "start": match.start(),
+            "end": match.end(),
+        })
+
+    for match in _NUMBER_RE.finditer(text):
+        raw_value = match.group(0)
+        digits = re.sub(r"\D", "", raw_value)
+        context = _nearest_context(text, match.start())
+        entity_type = None
+
+        # Ưu tiên nhãn ngữ cảnh để tránh nhầm CCCD với STK,
+        # hoặc nhầm số điện thoại với một loại số khác.
+        if context == "VN_BANK_ACCOUNT":
+            if 8 <= len(digits) <= 16:
+                entity_type = "VN_BANK_ACCOUNT"
+
+        elif context == "VN_CCCD":
+            if len(digits) == 12:
+                entity_type = "VN_CCCD"
+
+        elif context == "VN_PHONE":
+            if len(digits) in (10, 11) and digits.startswith("0"):
+                entity_type = "VN_PHONE"
+
+        else:
+            # Hỗ trợ trường hợp không có nhãn đi kèm.
+            if len(digits) == 12:
+                entity_type = "VN_CCCD"
+            elif len(digits) in (10, 11) and digits.startswith("0"):
+                entity_type = "VN_PHONE"
+
+        if entity_type is not None:
+            entities.append({
+                "type": entity_type,
+                "start": match.start(),
+                "end": match.end(),
+            })
+
+    return sorted(
+        entities,
+        key=lambda entity: (entity["start"], entity["end"]),
+    )
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    """Thay các entity được phát hiện bằng placeholder tương ứng."""
+    entities = detect(text)
+    if not entities:
+        return text
+
+    # Nếu có entity chồng lấn, giữ span dài hơn.
+    non_overlapping: list[dict] = []
+
+    for entity in sorted(
+        entities,
+        key=lambda item: (
+            -(item["end"] - item["start"]),
+            item["start"],
+        ),
+    ):
+        overlaps = any(
+            entity["start"] < chosen["end"]
+            and chosen["start"] < entity["end"]
+            for chosen in non_overlapping
+        )
+        if not overlaps:
+            non_overlapping.append(entity)
+
+    # Thay từ phải sang trái để offset ban đầu không bị lệch.
+    for entity in sorted(
+        non_overlapping,
+        key=lambda item: item["start"],
+        reverse=True,
+    ):
+        start = entity["start"]
+        end = entity["end"]
+        replacement = f"[REDACTED_{entity['type']}]"
+        text = text[:start] + replacement + text[end:]
+
+    return text
